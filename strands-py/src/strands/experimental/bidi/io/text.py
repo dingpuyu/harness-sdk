@@ -7,17 +7,17 @@ from prompt_toolkit import PromptSession
 
 from ....types.content import TextBlock
 from ..types.events import (
+    BidiBargeInEvent,
     BidiConnectionCloseEvent,
-    BidiInterruptionEvent,
     BidiOutputEvent,
     BidiTranscriptStreamEvent,
 )
-from ..types.io import BidiInput, BidiOutput
+from ..types.io import InputStream, OutputStream
 
 logger = logging.getLogger(__name__)
 
 
-class _BidiTextInput(BidiInput):
+class _ConsoleInputStream(InputStream):
     """Handle text input from user."""
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -31,14 +31,14 @@ class _BidiTextInput(BidiInput):
         return TextBlock(text.strip())
 
 
-class _BidiTextOutput(BidiOutput):
+class _ConsoleOutputStream(OutputStream):
     """Handle text output from bidi agent."""
 
     async def __call__(self, event: BidiOutputEvent) -> None:
         """Print text events to stdout."""
-        if isinstance(event, BidiInterruptionEvent):
-            logger.debug("reason=<%s> | text output interrupted", event["reason"])
-            print("interrupted")
+        if isinstance(event, BidiBargeInEvent):
+            logger.debug("reason=<%s> | barge-in detected", event["reason"])
+            print("barge-in")
 
         elif isinstance(event, BidiConnectionCloseEvent):
             if event.reason == "user_request":
@@ -53,7 +53,7 @@ class _BidiTextOutput(BidiOutput):
             print(event.delta)
 
 
-class BidiTextIO:
+class ConsoleIO:
     """Handle text input and output to and from bidi agent.
 
     Accepts input from stdin and outputs to stdout.
@@ -69,10 +69,10 @@ class BidiTextIO:
         """
         self._config = config
 
-    def input(self) -> _BidiTextInput:
-        """Return text processing BidiInput."""
-        return _BidiTextInput(self._config)
+    def input(self) -> _ConsoleInputStream:
+        """Return the standard-input stream."""
+        return _ConsoleInputStream(self._config)
 
-    def output(self) -> _BidiTextOutput:
-        """Return text processing BidiOutput."""
-        return _BidiTextOutput()
+    def output(self) -> _ConsoleOutputStream:
+        """Return the standard-output stream."""
+        return _ConsoleOutputStream()

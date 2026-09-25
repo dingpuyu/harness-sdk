@@ -6,7 +6,7 @@ capabilities with real-time audio and persistent connection support.
 Key features:
 
 - Audio output events with standardized formats
-- Interruption detection and handling
+- Barge-in detection and handling
 - Connection lifecycle management
 - Provider-agnostic event types
 - Type-safe discriminated unions with TypedEvent
@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 from ....types._events import ToolUseStreamEvent, TypedEvent
 
 if TYPE_CHECKING:
-    from ..models.model import BidiModelTimeoutError
+    from ..models.model import ConnectionTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +77,12 @@ def _normalize_role(role: Any, default: Role = "user") -> Role:
     return cast(Role, normalized)
 
 
-StopReason = Literal["complete", "error", "interrupted", "tool_use"]
+StopReason = Literal["complete", "error", "barge_in", "tool_use"]
 """Reason for the model ending its response generation.
 
 - "complete": Model completed its response.
 - "error": Model encountered an error.
-- "interrupted": Model was interrupted by the user.
+- "barge_in": User barged in during the response.
 - "tool_use": Model is requesting a tool use.
 """
 
@@ -96,7 +96,7 @@ class BidiConnectionStartEvent(TypedEvent):
 
     Parameters:
         connection_id: Unique identifier for this streaming connection.
-        model: Model identifier (e.g., "gpt-realtime", "gemini-2.0-flash-live").
+        model: Model identifier (e.g., "gpt-realtime-2.1", "gemini-3.8-live").
     """
 
     def __init__(self, connection_id: str, model: str):
@@ -116,7 +116,7 @@ class BidiConnectionStartEvent(TypedEvent):
 
     @property
     def model(self) -> str:
-        """Model identifier (e.g., 'gpt-realtime', 'gemini-2.0-flash-live')."""
+        """Model identifier (e.g., 'gpt-realtime-2.1', 'gemini-3.8-live')."""
         return cast(str, self["model"])
 
 
@@ -138,7 +138,7 @@ class BidiConnectionRestartEvent(TypedEvent):
     def __init__(
         self,
         reason: Literal["timeout", "scheduled"],
-        timeout_error: "BidiModelTimeoutError | None" = None,
+        timeout_error: "ConnectionTimeoutError | None" = None,
         turn_interrupted: bool = False,
     ):
         """Initialize connection restart event."""
@@ -157,9 +157,9 @@ class BidiConnectionRestartEvent(TypedEvent):
         return cast(str, self["reason"])
 
     @property
-    def timeout_error(self) -> "BidiModelTimeoutError | None":
-        """Model timeout error on the reactive path; None when scheduled."""
-        return cast("BidiModelTimeoutError | None", self["timeout_error"])
+    def timeout_error(self) -> "ConnectionTimeoutError | None":
+        """Connection timeout error on the reactive path; None when scheduled."""
+        return cast("ConnectionTimeoutError | None", self["timeout_error"])
 
     @property
     def turn_interrupted(self) -> bool:
@@ -315,25 +315,25 @@ class BidiTranscriptCompleteEvent(TypedEvent):
         return cast(Role, self["role"])
 
 
-class BidiInterruptionEvent(TypedEvent):
-    """Model generation was interrupted.
+class BidiBargeInEvent(TypedEvent):
+    """Stop current response generation or playback while the session continues.
 
     Parameters:
-        reason: Why the interruption occurred.
+        reason: Why response output should stop.
     """
 
     def __init__(self, reason: Literal["user_speech", "error"]):
-        """Initialize interruption event."""
+        """Initialize barge-in event."""
         super().__init__(
             {
-                "type": "bidi_interruption",
+                "type": "bidi_barge_in",
                 "reason": reason,
             }
         )
 
     @property
     def reason(self) -> str:
-        """Why the interruption occurred."""
+        """Why response output should stop."""
         return cast(str, self["reason"])
 
 
@@ -483,7 +483,7 @@ class BidiConnectionCloseEvent(TypedEvent):
 
     @property
     def reason(self) -> str:
-        """Why the interruption occurred."""
+        """Why the connection closed."""
         return cast(str, self["reason"])
 
 
@@ -553,7 +553,7 @@ BidiOutputEvent = (
     | BidiAudioStreamEvent
     | BidiTranscriptStreamEvent
     | BidiTranscriptCompleteEvent
-    | BidiInterruptionEvent
+    | BidiBargeInEvent
     | BidiResponseCompleteEvent
     | BidiUsageEvent
     | BidiConnectionCloseEvent

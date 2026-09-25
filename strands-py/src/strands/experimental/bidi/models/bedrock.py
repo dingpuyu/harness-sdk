@@ -10,7 +10,7 @@ Nova Sonic specifics:
 - Base64-encoded audio format with hex encoding
 - Tool execution with content containers and identifier tracking
 - 8-minute connection limits with proper cleanup sequences
-- Interruption detection through stopReason events
+- Barge-in detection through stopReason events
 
 Note, BedrockNovaSonicModel is only supported for Python 3.12+
 """
@@ -54,8 +54,8 @@ from .._async import stop_all
 from ..types.content import BidiContentBlock, BidiContentDelta
 from ..types.events import (
     BidiAudioStreamEvent,
+    BidiBargeInEvent,
     BidiConnectionStartEvent,
-    BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
@@ -69,18 +69,15 @@ from .configs import (
     AudioStreamConfig,
     BedrockNovaSonicAudioConfig,
     BedrockNovaSonicAudioStreamConfig,
-    BidiConnectionConfig,
-    BidiModelConfig,
+    ConnectionConfig,
+    ModelConfig,
+    ModelUpdateConfig,
     _validate_audio_config,
     _validate_model_config,
 )
-from .model import AudioCapable, BidiModel, BidiModelTimeoutError
+from .model import AudioCapable, BidiModel, ConnectionTimeoutError
 
 logger = logging.getLogger(__name__)
-
-# Nova Sonic model identifiers
-NOVA_SONIC_V1_MODEL_ID = "amazon.nova-sonic-v1:0"
-NOVA_SONIC_V2_MODEL_ID = "amazon.nova-2-sonic-v1:0"
 
 NOVA_TEXT_CONFIG = {"mediaType": "text/plain"}
 NOVA_TOOL_CONFIG = {"mediaType": "application/json"}
@@ -215,7 +212,7 @@ class BedrockNovaSonicModel(BidiModel, AudioCapable):
         region: str | None = None,
         audio: BedrockNovaSonicAudioConfig | None = None,
         voice: str = "matthew",
-        **model_config: Unpack[BidiModelConfig],
+        **model_config: Unpack[ModelConfig],
     ) -> None:
         """Initialize Nova Sonic bidirectional model.
 
@@ -227,22 +224,23 @@ class BedrockNovaSonicModel(BidiModel, AudioCapable):
             **model_config: Model configuration.
 
         Raises:
-            ValueError: If audio options or the resolved region are invalid, or both ``boto_session`` and
-                ``region`` are provided.
+            ValueError: If any of the following conditions apply:
+
+                - Required model configuration fields are missing.
+                - ``model_id`` is not a non-empty string.
+                - Audio options or the resolved region are invalid.
+                - Both ``boto_session`` and ``region`` are provided.
         """
         if boto_session is not None and region is not None:
             raise ValueError("Cannot specify both 'boto_session' and 'region'")
 
         _validate_model_config(model_config)
-        self._config = BidiModelConfig(**model_config)
-        self._config.setdefault("model_id", NOVA_SONIC_V2_MODEL_ID)
+        self._config = ModelConfig(**model_config)
         self._config["params"] = dict(self._config.get("params") or {})
 
         # Nova caps a connection at ~8 min; reconnect at 7 min, leaving headroom below the cap.
         # It also reports cumulative usage totals.
-        self._config["connection"] = BidiConnectionConfig(
-            **{"restart_after_s": 420, **self._config.get("connection", {})}
-        )
+        self._config["connection"] = ConnectionConfig(**{"restart_after_s": 420, **self._config.get("connection", {})})
         self.usage_is_cumulative = True
 
         self._resolve_audio_config(audio)
@@ -263,17 +261,23 @@ class BedrockNovaSonicModel(BidiModel, AudioCapable):
         logger.debug("model_id=<%s> | nova sonic model initialized", self._config["model_id"])
 
     @override
-    def update_config(self, **model_config: Unpack[BidiModelConfig]) -> None:  # type: ignore[override]
+    def update_config(self, **model_config: Unpack[ModelUpdateConfig]) -> None:  # type: ignore[override]
         """Update the model configuration with the provided arguments.
 
         Args:
             **model_config: Configuration overrides.
+
+        Raises:
+            ValueError: If any of the following conditions apply:
+
+                - The resulting configuration is missing required fields.
+                - ``model_id`` is not a non-empty string.
         """
-        _validate_model_config(model_config)
+        _validate_model_config(self._config | model_config)
         self._config.update(model_config)
 
     @override
-    def get_config(self) -> BidiModelConfig:
+    def get_config(self) -> ModelConfig:
         """Return the model configuration by reference."""
         return self._config
 
@@ -459,11 +463,11 @@ class BedrockNovaSonicModel(BidiModel, AudioCapable):
             except ValidationException as error:
                 if "InternalErrorCode=531" in error.message:
                     # nova also times out if user is silent for 175 seconds
-                    raise BidiModelTimeoutError(error.message) from error
+                    raise ConnectionTimeoutError(error.message) from error
                 raise
 
             except ModelTimeoutException as error:
-                raise BidiModelTimeoutError(error.message) from error
+                raise ConnectionTimeoutError(error.message) from error
 
             # Per the smithy EventReceiver contract, receive() returns None only at
             # end-of-stream (e.g. the connection closed during reconnect). A closed receiver
@@ -733,11 +737,11 @@ class BedrockNovaSonicModel(BidiModel, AudioCapable):
             text_output = nova_event["textOutput"]
             text_content = text_output["content"]
             role = text_output["role"].strip().lower()
-            # Check for Nova Sonic interruption pattern
+            # Check for Nova Sonic barge-in pattern
             if '{ "interrupted" : true }' in text_content:
-                logger.debug("nova interruption detected in text output")
+                logger.debug("nova barge-in detected in text output")
                 response_state.reset()
-                return [BidiInterruptionEvent(reason="user_speech")]
+                return [BidiBargeInEvent(reason="user_speech")]
 
             if role == "user":
                 return [BidiTranscriptStreamEvent(delta=response_state.append_transcript(text_content), role="user")]
@@ -771,11 +775,11 @@ class BedrockNovaSonicModel(BidiModel, AudioCapable):
                 )
             ]
 
-        # Handle interruption
+        # Handle barge-in
         if nova_event.get("stopReason") == "INTERRUPTED":
-            logger.debug("nova interruption detected via stop reason")
+            logger.debug("nova barge-in detected via stop reason")
             response_state.reset()
-            return [BidiInterruptionEvent(reason="user_speech")]
+            return [BidiBargeInEvent(reason="user_speech")]
 
         # Handle usage events - convert to multimodal usage format
         if "usageEvent" in nova_event:
@@ -822,7 +826,7 @@ class BedrockNovaSonicModel(BidiModel, AudioCapable):
             if stop_reason == "INTERRUPTED" or (stop_reason == "END_TURN" and is_final_text):
                 response_complete = BidiResponseCompleteEvent(
                     response_id=self._current_completion_id or str(uuid.uuid4()),
-                    stop_reason="interrupted" if stop_reason == "INTERRUPTED" else "complete",
+                    stop_reason="barge_in" if stop_reason == "INTERRUPTED" else "complete",
                 )
                 if stop_reason != "INTERRUPTED" and response_state.transcript:
                     transcript_complete = BidiTranscriptCompleteEvent(response_state.transcript, "assistant")

@@ -25,19 +25,19 @@ from ..hooks.events import (
     BidiBeforeConnectionRestartEvent,
 )
 from ..hooks.events import (
-    BidiInterruptionEvent as BidiInterruptionHookEvent,
+    BidiBargeInEvent as BidiBargeInHookEvent,
 )
 from ..hooks.events import (
     BidiResponseCompleteEvent as BidiResponseCompleteHookEvent,
 )
-from ..models import BidiModelTimeoutError, Restartable
+from ..models import ConnectionTimeoutError, Restartable
 from ..types.content import BidiContentBlock, BidiContentDelta
 from ..types.events import (
     BidiAudioStreamEvent,
+    BidiBargeInEvent,
     BidiConnectionCloseEvent,
     BidiConnectionRestartEvent,
     BidiConnectionWarningEvent,
-    BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
@@ -45,7 +45,7 @@ from ..types.events import (
     BidiTranscriptStreamEvent,
     BidiUsageEvent,
 )
-from ._reconnect_timer import BidiReconnectTimer, resolve_deadline_s
+from ._reconnect_timer import _ReconnectTimer, resolve_deadline_s
 
 if TYPE_CHECKING:
     from .agent import BidiAgent
@@ -74,7 +74,7 @@ class _ReaderError:
     error: Exception
 
 
-class _BidiAgentLoop:
+class _AgentLoop:
     """Agent loop.
 
     Attributes:
@@ -119,7 +119,7 @@ class _BidiAgentLoop:
         self._baseline_total_tokens = 0
         self._baseline_cache_read_tokens = 0
 
-        self._reconnect_timer = BidiReconnectTimer(
+        self._reconnect_timer = _ReconnectTimer(
             on_warning=self._on_reconnect_warning,
             on_deadline=self._on_reconnect_deadline,
         )
@@ -278,7 +278,7 @@ class _BidiAgentLoop:
                     logger.debug("dropping stale reader error from a superseded connection")
                     continue
                 error = event.error
-                if isinstance(error, BidiModelTimeoutError):
+                if isinstance(error, ConnectionTimeoutError):
                     logger.debug("model timeout error received")
                     if not self._auto_reconnect_enabled():
                         logger.debug("auto_reconnect disabled | surfacing timeout to caller")
@@ -390,7 +390,7 @@ class _BidiAgentLoop:
 
     async def _restart_connection(
         self,
-        timeout_error: BidiModelTimeoutError | None,
+        timeout_error: ConnectionTimeoutError | None,
         generation: int,
         *,
         restart_event: BidiConnectionRestartEvent | None = None,
@@ -457,7 +457,7 @@ class _BidiAgentLoop:
         return True
 
     async def _swap_connection(
-        self, reason: Literal["timeout", "scheduled"], timeout_error: BidiModelTimeoutError | None
+        self, reason: Literal["timeout", "scheduled"], timeout_error: ConnectionTimeoutError | None
     ) -> None:
         """Swap to a new connection under a restart span, firing the after-restart hook.
 
@@ -602,7 +602,7 @@ class _BidiAgentLoop:
                         _telemetry.end_response_span(
                             self._tracer,
                             response_span,
-                            stop_reason="interrupted",
+                            stop_reason="barge_in",
                             time_to_first_audio_ms=time_to_first_audio_ms,
                         )
                     response_span = _telemetry.start_response_span(
@@ -656,19 +656,15 @@ class _BidiAgentLoop:
                     if generation != self._generation:
                         return
 
-                elif isinstance(event, BidiInterruptionEvent):
+                elif isinstance(event, BidiBargeInEvent):
                     if self._session_span:
-                        _telemetry.add_interruption_event(self._session_span, event["reason"])
+                        _telemetry.add_barge_in_event(self._session_span, event["reason"])
 
                     # A barge-in ends the current response; the user's next turn owes a reply.
                     self._response_active = False
                     self._update_turn_state()
                     await self._agent.hooks.invoke_callbacks_async(
-                        BidiInterruptionHookEvent(
-                            agent=self._agent,
-                            reason=event["reason"],
-                            interrupted_response_id=event.get("interrupted_response_id"),
-                        )
+                        BidiBargeInHookEvent(agent=self._agent, reason=event["reason"])
                     )
                     if generation != self._generation:
                         return

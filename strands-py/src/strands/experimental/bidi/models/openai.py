@@ -27,8 +27,8 @@ from .._async import stop_all
 from ..types.content import BidiContentBlock, BidiContentDelta
 from ..types.events import (
     BidiAudioStreamEvent,
+    BidiBargeInEvent,
     BidiConnectionStartEvent,
-    BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
@@ -43,13 +43,14 @@ from ..types.media import AudioDelta
 from .configs import (
     AudioConfig,
     AudioStreamConfig,
-    BidiConnectionConfig,
-    BidiModelConfig,
+    ConnectionConfig,
+    ModelConfig,
+    ModelUpdateConfig,
     _merge_config,
     _validate_audio_config,
     _validate_model_config,
 )
-from .model import AudioCapable, BidiModel, BidiModelTimeoutError
+from .model import AudioCapable, BidiModel, ConnectionTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,6 @@ handle the connection closure. We set the max to 50 minutes to provide enough bu
 # the reactive timeout firing at the same instant.
 OPENAI_PROACTIVE_RECONNECT_MARGIN_S = 300
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
-DEFAULT_MODEL = "gpt-realtime"
 DEFAULT_SAMPLE_RATE = 24000
 
 DEFAULT_SESSION_CONFIG = {
@@ -119,7 +119,7 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         project: str | None = None,
         timeout_s: int = OPENAI_MAX_TIMEOUT_S,
         voice: str = "alloy",
-        **model_config: Unpack[BidiModelConfig],
+        **model_config: Unpack[ModelConfig],
     ) -> None:
         """Initialize OpenAI Realtime bidirectional model.
 
@@ -132,12 +132,16 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
             **model_config: Model configuration.
 
         Raises:
-            ValueError: If the API key is missing, ``timeout_s`` exceeds the maximum,
-                or audio formats are unsupported.
+            ValueError: If any of the following conditions apply:
+
+                - Required model configuration fields are missing.
+                - ``model_id`` is not a non-empty string.
+                - The API key is missing.
+                - ``timeout_s`` exceeds the maximum.
+                - The configured audio formats are unsupported.
         """
         _validate_model_config(model_config)
-        self._config = BidiModelConfig(**model_config)
-        self._config.setdefault("model_id", DEFAULT_MODEL)
+        self._config = ModelConfig(**model_config)
         self._config["params"] = dict(self._config.get("params") or {})
 
         # OpenAI reports per-response token usage on response.done, not cumulative session totals.
@@ -160,7 +164,7 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         # OpenAI emits no approaching-limit warning, so reconnect proactively a margin below the
         # reader's reactive timeout: the swap can then align to a turn boundary before the reactive
         # path fires. Deriving from timeout_s keeps that headroom when a caller lowers it.
-        self._config["connection"] = BidiConnectionConfig(
+        self._config["connection"] = ConnectionConfig(
             **{
                 "restart_after_s": timeout_s - OPENAI_PROACTIVE_RECONNECT_MARGIN_S,
                 **self._config.get("connection", {}),
@@ -178,22 +182,26 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         logger.debug("model=<%s> | openai realtime model initialized", self._config["model_id"])
 
     @override
-    def update_config(self, **model_config: Unpack[BidiModelConfig]) -> None:  # type: ignore[override]
+    def update_config(self, **model_config: Unpack[ModelUpdateConfig]) -> None:  # type: ignore[override]
         """Update the model configuration with the provided arguments.
 
         Args:
             **model_config: Configuration overrides.
 
         Raises:
-            ValueError: If the configured audio formats are unsupported.
+            ValueError: If any of the following conditions apply:
+
+                - The resulting configuration is missing required fields.
+                - ``model_id`` is not a non-empty string.
+                - The configured audio formats are unsupported.
         """
-        _validate_model_config(model_config)
+        _validate_model_config(self._config | model_config)
         if "params" in model_config:
             self._resolve_audio_config(model_config["params"])
         self._config.update(model_config)
 
     @override
-    def get_config(self) -> BidiModelConfig:
+    def get_config(self) -> ModelConfig:
         """Return the model configuration by reference."""
         return self._config
 
@@ -276,11 +284,11 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
             role=cast(Role, role),
         )
 
-    def _create_voice_activity_event(self, activity_type: str) -> BidiInterruptionEvent | None:
-        """Create standardized interruption event for voice activity."""
-        # Only speech_started triggers interruption
+    def _create_voice_activity_event(self, activity_type: str) -> BidiBargeInEvent | None:
+        """Create standardized barge-in event for voice activity."""
+        # Only speech_started triggers barge-in
         if activity_type == "speech_started":
-            return BidiInterruptionEvent(reason="user_speech")
+            return BidiBargeInEvent(reason="user_speech")
         # Other voice activity events are logged but don't create events
         return None
 
@@ -446,7 +454,7 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         while True:
             duration = time.time() - start_time
             if duration >= self.timeout_s:
-                raise BidiModelTimeoutError(f"timeout_s=<{self.timeout_s}>")
+                raise ConnectionTimeoutError(f"timeout_s=<{self.timeout_s}>")
 
             try:
                 message = await asyncio.wait_for(websocket.recv(), timeout=10)
@@ -546,17 +554,17 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
                     del self._function_call_buffer[call_id]
             return None
 
-        # Voice activity detection - speech_started triggers interruption
+        # Voice activity detection - speech_started triggers barge-in
         elif event_type == "input_audio_buffer.speech_started":
-            # This is the primary interruption signal - handle it first
-            return [BidiInterruptionEvent(reason="user_speech")]
+            # This is the primary barge-in signal - handle it first
+            return [BidiBargeInEvent(reason="user_speech")]
 
-        # Response cancelled - handle interruption
+        # Response cancelled - handle barge-in
         elif event_type == "response.cancelled":
             response = openai_event.get("response", {})
             response_id = response.get("id", "unknown")
             logger.debug("response_id=<%s> | openai response cancelled", response_id)
-            return [BidiResponseCompleteEvent(response_id=response_id, stop_reason="interrupted")]
+            return [BidiResponseCompleteEvent(response_id=response_id, stop_reason="barge_in")]
 
         # Turn complete and usage - response finished
         elif event_type == "response.done":
@@ -568,9 +576,9 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
             # Map OpenAI status to our stop_reason
             stop_reason_map = {
                 "completed": "complete",
-                "cancelled": "interrupted",
+                "cancelled": "barge_in",
                 "failed": "error",
-                "incomplete": "interrupted",
+                "incomplete": "barge_in",
             }
 
             # Build list of events to return

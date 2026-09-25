@@ -9,7 +9,7 @@ Key improvements over custom WebSocket implementation:
 - Simplified session management with client.aio.live.connect()
 - Built-in tool integration and event handling
 - Automatic WebSocket connection management and error handling
-- Native support for audio/text streaming and interruption
+- Native support for audio/text streaming and barge-in
 """
 
 import base64
@@ -34,8 +34,8 @@ from .._async import stop_all
 from ..types.content import BidiContentBlock, BidiContentDelta
 from ..types.events import (
     BidiAudioStreamEvent,
+    BidiBargeInEvent,
     BidiConnectionStartEvent,
-    BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
@@ -48,15 +48,16 @@ from ..types.media import AudioDelta
 from .configs import (
     AudioConfig,
     AudioStreamConfig,
-    BidiConnectionConfig,
-    BidiModelConfig,
+    ConnectionConfig,
     GoogleGeminiLiveAudioConfig,
     GoogleGeminiLiveAudioStreamConfig,
+    ModelConfig,
+    ModelUpdateConfig,
     _merge_config,
     _validate_audio_config,
     _validate_model_config,
 )
-from .model import AudioCapable, BidiModel, BidiModelTimeoutError
+from .model import AudioCapable, BidiModel, ConnectionTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         client_args: dict[str, Any] | None = None,
         audio: GoogleGeminiLiveAudioConfig | None = None,
         voice: str | None = None,
-        **model_config: Unpack[BidiModelConfig],
+        **model_config: Unpack[ModelConfig],
     ) -> None:
         """Initialize the Google Gemini Live bidirectional model.
 
@@ -101,18 +102,19 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
             **model_config: Model configuration.
 
         Raises:
-            ValueError: If the input sample rate is not positive.
+            ValueError: If any of the following conditions apply:
+
+                - Required model configuration fields are missing.
+                - ``model_id`` is not a non-empty string.
+                - The input sample rate is not positive.
         """
         _validate_model_config(model_config)
-        self._config = BidiModelConfig(**model_config)
-        self._config.setdefault("model_id", "gemini-2.5-flash-native-audio-preview-09-2025")
+        self._config = ModelConfig(**model_config)
         self._config["params"] = dict(self._config.get("params") or {})
 
         # Gemini caps a single connection at ~10 min; reconnect before that, resuming the same
         # session via its handle. The GoAway message remains the reactive backstop.
-        self._config["connection"] = BidiConnectionConfig(
-            **{"restart_after_s": 540, **self._config.get("connection", {})}
-        )
+        self._config["connection"] = ConnectionConfig(**{"restart_after_s": 540, **self._config.get("connection", {})})
         # Gemini reports per-response token deltas, not cumulative session totals.
         self.usage_is_cumulative = False
 
@@ -129,17 +131,23 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         self._connection_id: str | None = None
 
     @override
-    def update_config(self, **model_config: Unpack[BidiModelConfig]) -> None:  # type: ignore[override]
+    def update_config(self, **model_config: Unpack[ModelUpdateConfig]) -> None:  # type: ignore[override]
         """Update the model configuration with the provided arguments.
 
         Args:
             **model_config: Configuration overrides.
+
+        Raises:
+            ValueError: If any of the following conditions apply:
+
+                - The resulting configuration is missing required fields.
+                - ``model_id`` is not a non-empty string.
         """
-        _validate_model_config(model_config)
+        _validate_model_config(self._config | model_config)
         self._config.update(model_config)
 
     @override
-    def get_config(self) -> BidiModelConfig:
+    def get_config(self) -> ModelConfig:
         """Return the model configuration by reference."""
         return self._config
 
@@ -276,10 +284,10 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
             List of event dicts (empty list if no events to emit).
 
         Raises:
-            BidiModelTimeoutError: If gemini responds with go away message.
+            ConnectionTimeoutError: If Gemini responds with a go-away message.
         """
         if message.go_away:
-            raise BidiModelTimeoutError(
+            raise ConnectionTimeoutError(
                 message.go_away.model_dump_json(), live_session_handle=self._live_session_handle
             )
 
@@ -357,7 +365,7 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
             a response-complete when it closes.
         """
         server_content = message.server_content
-        interrupted = bool(server_content and server_content.interrupted)
+        barge_in = bool(server_content and server_content.interrupted)
         turn_complete = bool(server_content and server_content.turn_complete)
         produced_model_output = any(
             isinstance(event, (BidiAudioStreamEvent, ToolUseStreamEvent))
@@ -366,15 +374,15 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         )
 
         wrapped: list[BidiOutputEvent] = []
-        # An interruption ends a turn, it does not start one, so it never opens a response.
-        if produced_model_output and not turn_state.response_open and not interrupted:
+        # A barge-in ends a turn, it does not start one, so it never opens a response.
+        if produced_model_output and not turn_state.response_open and not barge_in:
             turn_state.response_open = True
             turn_state.response_id = str(uuid.uuid4())
             wrapped.append(BidiResponseStartEvent(response_id=turn_state.response_id))
 
         wrapped.extend(events)
 
-        if interrupted:
+        if barge_in:
             turn_state.response_open = False
             turn_state.output_transcript = ""
         if turn_complete and turn_state.input_transcript:
@@ -413,7 +421,7 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         events: list[BidiOutputEvent] = []
 
         if server_content.interrupted:
-            events.append(BidiInterruptionEvent(reason="user_speech"))
+            events.append(BidiBargeInEvent(reason="user_speech"))
 
         input_transcript = server_content.input_transcription
         if input_transcript and input_transcript.text:
@@ -519,7 +527,7 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         """Internal: Send audio content using Gemini Live API.
 
         Gemini Live expects continuous audio streaming via send_realtime_input.
-        This automatically triggers VAD and can interrupt ongoing responses.
+        This automatically triggers VAD and allows users to barge in during ongoing responses.
         """
         audio_bytes = audio_input.source.get("bytes")
         if audio_bytes is None:
@@ -529,7 +537,7 @@ class GoogleGeminiLiveModel(BidiModel, AudioCapable):
         mime_type = f"audio/pcm;rate={self._audio_config['input']['sample_rate']}"
         audio_blob = genai_types.Blob(data=audio_bytes, mime_type=mime_type)
 
-        # Send real-time audio input - this automatically handles VAD and interruption
+        # Send real-time audio input - this automatically handles VAD and barge-in
         await self._live_session.send_realtime_input(audio=audio_blob)
 
     async def _send_image_content(self, image_input: ImageBlock) -> None:
